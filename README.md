@@ -3,8 +3,8 @@
 > Three-tier polite HTTP fetcher with `Retry-After` honoring, per-domain token-bucket rate limiting, and auto-escalation to TLS-fingerprint impersonation on WAF detection. Drop-in `requests`-compatible. 19 tests passing, zero hard dependencies for Tier-1.
 
 [![CI](https://github.com/M00C1FER/polite-fetch/actions/workflows/ci.yml/badge.svg)](https://github.com/M00C1FER/polite-fetch/actions)
-[![PyPI](https://img.shields.io/pypi/v/polite-fetch.svg)](https://pypi.org/project/polite-fetch/)
-[![Python](https://img.shields.io/pypi/pyversions/polite-fetch.svg)](https://pypi.org/project/polite-fetch/)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 ## What it does
 
@@ -26,7 +26,8 @@ This library bundles them. Tier 1 is the polite default; Tier 2 fires automatica
 ## Quick start
 
 ```bash
-pip install polite-fetch
+# Install from GitHub (PyPI release pending)
+pip install git+https://github.com/M00C1FER/polite-fetch.git
 polite-fetch https://example.com
 ```
 
