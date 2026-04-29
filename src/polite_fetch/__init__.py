@@ -1,12 +1,14 @@
 """polite-fetch: three-tier polite HTTP fetching for Python."""
-from ._core import (
-    polite_fetch,
-    parse_retry_after,
+from ._core import (  # noqa: F401  (test-suite imports)
+    _tier1_fetch,
+    _tier2_fetch,
+    _TokenBucket,
+    browser_hint_headers,
     full_jitter_backoff,
     looks_like_anti_bot,
-    browser_hint_headers,
+    parse_retry_after,
+    polite_fetch,
 )
-from ._core import _TokenBucket, _tier1_fetch, _tier2_fetch  # noqa: F401  (test-suite imports)
 
 __version__ = "0.1.0"
 __all__ = [

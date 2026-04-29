@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Any, Dict
+from typing import Any
 
 from . import polite_fetch as _polite_fetch
 
@@ -44,7 +44,7 @@ def polite_fetch_url(url: str, max_attempts: int = 4, timeout: int = 30) -> str:
 
     Returns: JSON {ok, status, headers, content, tier, attempts, escalated, reason?}
     """
-    result: Dict[str, Any] = _polite_fetch(url, max_attempts=max_attempts, timeout=timeout)
+    result: dict[str, Any] = _polite_fetch(url, max_attempts=max_attempts, timeout=timeout)
     return json.dumps(result)
 
 

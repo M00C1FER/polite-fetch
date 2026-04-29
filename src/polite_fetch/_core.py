@@ -40,11 +40,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import time
 from email.utils import parsedate_to_datetime
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 logger = logging.getLogger("polite_fetch")
@@ -72,9 +73,6 @@ _ANTI_BOT_SIGNATURES = (
 )
 
 
-import os
-
-
 def _env_bool(key: str, default: bool) -> bool:
     val = os.environ.get(key)
     if val is None:
@@ -82,7 +80,7 @@ def _env_bool(key: str, default: bool) -> bool:
     return val.lower() in ("1", "true", "yes", "on")
 
 
-def _load_config() -> Dict[str, Any]:
+def _load_config() -> dict[str, Any]:
     return {
         "user_agent": os.environ.get("POLITE_FETCH_USER_AGENT", _DEFAULT_USER_AGENT),
         "per_domain_rps": float(os.environ.get("POLITE_FETCH_RPS", "1.0")),
@@ -98,7 +96,7 @@ def _load_config() -> Dict[str, Any]:
 # ── Retry-After parsing (RFC 7231 §7.1.3) ────────────────────────────────────
 
 
-def parse_retry_after(value: Optional[str]) -> Optional[float]:
+def parse_retry_after(value: str | None) -> float | None:
     """Parse a Retry-After header.
 
     RFC 7231 §7.1.3: integer seconds or HTTP-date. Returns None if neither.
@@ -145,7 +143,7 @@ class _TokenBucket:
         self.last_refill = time.monotonic()
         self.lock = Lock()
 
-    def acquire(self, blocking: bool = True, timeout: Optional[float] = None) -> bool:
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
         """Acquire 1 token. Blocks until available unless blocking=False.
 
         Returns True if acquired, False if non-blocking and unavailable
@@ -171,7 +169,7 @@ class _TokenBucket:
             time.sleep(min(wait, 0.5))
 
 
-_BUCKETS: Dict[str, _TokenBucket] = {}
+_BUCKETS: dict[str, _TokenBucket] = {}
 _BUCKETS_LOCK = Lock()
 
 
@@ -195,7 +193,7 @@ def _domain_of(url: str) -> str:
 # ── Anti-bot signature detection ─────────────────────────────────────────────
 
 
-def looks_like_anti_bot(status: int, body: str, headers: Dict[str, str]) -> bool:
+def looks_like_anti_bot(status: int, body: str, headers: dict[str, str]) -> bool:
     """Heuristic — does this 4xx response look like an anti-bot challenge?
 
     Looking at:
@@ -249,7 +247,7 @@ _HAND_ROLLED_HINTS = {
 }
 
 
-def browser_hint_headers(impersonate_target: str) -> Dict[str, str]:
+def browser_hint_headers(impersonate_target: str) -> dict[str, str]:
     """Return Sec-CH-UA + UA + Sec-Fetch-* headers consistent with the target.
 
     Tries browserforge first (Bayesian network for statistically-correlated
@@ -267,7 +265,7 @@ def browser_hint_headers(impersonate_target: str) -> Dict[str, str]:
 # ── Tier-1 fetcher: requests + honest UA ─────────────────────────────────────
 
 
-def _tier1_fetch(url: str, timeout: int, headers: Dict[str, str]) -> Dict[str, Any]:
+def _tier1_fetch(url: str, timeout: int, headers: dict[str, str]) -> dict[str, Any]:
     try:
         import requests
         r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
@@ -292,7 +290,7 @@ def _tier1_fetch(url: str, timeout: int, headers: Dict[str, str]) -> Dict[str, A
 # ── Tier-2 fetcher: curl_cffi browser-impersonate ────────────────────────────
 
 
-def _tier2_fetch(url: str, timeout: int, impersonate: str) -> Dict[str, Any]:
+def _tier2_fetch(url: str, timeout: int, impersonate: str) -> dict[str, Any]:
     try:
         from curl_cffi import requests as cf_requests  # type: ignore
         r = cf_requests.get(url, impersonate=impersonate, timeout=timeout, allow_redirects=True)  # type: ignore[arg-type]
@@ -318,8 +316,8 @@ def polite_fetch(
     max_attempts: int = 4,
     timeout: int = 30,
     cap_backoff: float = 60.0,
-    config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Fetch a URL with politeness-first hierarchy + Retry-After + jitter.
 
     Tier-1 (default): requests + honest contact-bearing UA.
@@ -341,8 +339,8 @@ def polite_fetch(
     domain = _domain_of(url)
     bucket = _get_bucket(domain, cfg["per_domain_rps"], cfg["per_domain_burst"])
 
-    last_result: Dict[str, Any] = {"ok": False, "status": 0, "tier": 0, "content": "", "headers": {}}
-    retry_after_observed: List[float] = []
+    last_result: dict[str, Any] = {"ok": False, "status": 0, "tier": 0, "content": "", "headers": {}}
+    retry_after_observed: list[float] = []
     escalated = False
 
     for attempt in range(max_attempts):
