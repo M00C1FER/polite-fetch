@@ -1,3 +1,9 @@
+> ⚠️ **DEPRECATED — v0.1 archived 2026-04-30.**  This repo was a portfolio exercise. After a 12-iteration / 27-domain competitive analysis, the recommended production path is:
+>
+> **aiometer** (https://github.com/florimondmanca/aiometer) for rate limiting · **curl_cffi** (https://github.com/lexiforest/curl_cffi) for TLS-fingerprint impersonation
+>
+> The code below remains available for reference but is **no longer maintained**. See the linked alternatives for production use.
+
 # polite-fetch
 
 > Three-tier polite HTTP fetcher with `Retry-After` honoring, per-domain token-bucket rate limiting, and auto-escalation to TLS-fingerprint impersonation on WAF detection. Drop-in `requests`-compatible. 19 tests passing, zero hard dependencies for Tier-1.
