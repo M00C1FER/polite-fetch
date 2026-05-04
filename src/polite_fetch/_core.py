@@ -38,10 +38,12 @@ on first call. curl_cffi and playwright imports are deferred.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import random
+import socket
 import time
 from email.utils import parsedate_to_datetime
 from threading import Lock
@@ -49,6 +51,38 @@ from typing import Any
 from urllib.parse import urlparse
 
 logger = logging.getLogger("polite_fetch")
+
+
+def _validate_url(url: str) -> None:
+    """Reject non-http(s) schemes and RFC-1918/loopback targets (SSRF guard).
+
+    Call before any network fetch. Raises ValueError on blocked URLs.
+    Performs both parse-time scheme check and DNS-resolved IP validation
+    so DNS-rebinding attacks are also blocked.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"polite-fetch: forbidden scheme {parsed.scheme!r} — only http/https allowed"
+        )
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("polite-fetch: URL has no hostname")
+    try:
+        addrs = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        raise ValueError(f"polite-fetch: DNS resolution failed for {host!r}: {exc}") from exc
+    for ai in addrs:
+        ip_str = ai[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            raise ValueError(
+                f"polite-fetch: SSRF blocked — {host!r} resolves to reserved address {ip_str}"
+            )
+
 
 # ── Config (read once; refreshed by research_limits hot-reload) ─────────────
 
@@ -335,6 +369,7 @@ def polite_fetch(
         dict with keys: ok, status, headers, content, tier, attempts,
         domain, retry_after_observed, escalated.
     """
+    _validate_url(url)
     cfg = config or _load_config()
     domain = _domain_of(url)
     bucket = _get_bucket(domain, cfg["per_domain_rps"], cfg["per_domain_burst"])
