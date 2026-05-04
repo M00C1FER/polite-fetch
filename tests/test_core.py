@@ -249,8 +249,6 @@ def test_robots_base_url_preserves_port():
 
 def test_fetch_robots_200_parses(monkeypatch):
     """200 response with disallow rule is parsed correctly."""
-    import urllib.robotparser
-
     class FakeResp:
         status_code = 200
         text = "User-agent: *\nDisallow: /private/"
