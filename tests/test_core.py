@@ -4,6 +4,18 @@ from __future__ import annotations
 import time
 
 from polite_fetch import _core as pf
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_module_globals():
+    """Clear module-level caches between tests to prevent cross-test pollution."""
+    import polite_fetch._core as _pf
+    _pf._ROBOTS_CACHE.clear()
+    _pf._BUCKETS.clear()
+    yield
+    _pf._ROBOTS_CACHE.clear()
+    _pf._BUCKETS.clear()
 
 # ── parse_retry_after ────────────────────────────────────────────────────────
 
@@ -478,6 +490,8 @@ def test_polite_fetch_applies_crawl_delay(monkeypatch):
     monkeypatch.setattr(pf, "can_fetch", fake_can_fetch)
     monkeypatch.setattr(pf, "robots_crawl_delay", fake_robots_crawl_delay)
     monkeypatch.setattr(pf, "_apply_robots_crawl_delay", spy_apply)
+    # Skip SSRF DNS lookup — crawldelay.example.com is a fake test domain
+    monkeypatch.setattr(pf, "_validate_url", lambda url: None)
 
     def fake_tier1(url, timeout, headers):
         return {"ok": True, "status": 200, "headers": {}, "content": "ok", "tier": 1}
