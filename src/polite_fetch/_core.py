@@ -233,7 +233,13 @@ def _fetch_and_parse_robots(
             parser.parse(r.text.splitlines())
         elif r.status_code in (401, 403):
             parser.parse(["User-agent: *", "Disallow: /"])
-        # 404 or other → leave parser empty → can_fetch returns True (allow all)
+        else:
+            # 404 or other → allow all per RFC 9309 §2.2.3.
+            # RobotFileParser.can_fetch() only returns True when allow_all is
+            # explicitly set; the default is False. We must set it here because
+            # our code uses requests+parse(), not the stdlib read() call that
+            # would normally set allow_all for 4xx responses.
+            parser.allow_all = True
     except Exception:
         return None
     return parser
