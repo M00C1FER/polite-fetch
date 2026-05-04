@@ -11,6 +11,8 @@ Cross-cutting:
   • RFC 7231 §7.1.3 Retry-After honoring on 429/503 (integer or HTTP-date).
   • Full-jitter exponential backoff (AWS pattern) between attempts.
   • Per-domain token-bucket rate ledger (default 1 RPS / burst 5).
+  • robots.txt can_fetch() gate before every request (RFC 9309; 24h TTL cache).
+  • robots.txt Crawl-Delay honored by capping the token-bucket rate.
   • Anti-bot signature detection across Cloudflare/DataDome/PerimeterX/Akamai/
     Imperva/Kasada (status code + body markers + header values).
 
@@ -19,6 +21,7 @@ Configuration via env vars (all optional):
   POLITE_FETCH_RPS              (default: 1.0)
   POLITE_FETCH_BURST            (default: 5)
   POLITE_FETCH_RETRY_AFTER_MAX  (default: 300)
+  POLITE_FETCH_HONOR_ROBOTS     (default: 1)  — 0 to disable robots.txt check
   POLITE_FETCH_ESCALATE_TIER2   (default: 1)
   POLITE_FETCH_ESCALATE_TIER3   (default: 0)
   POLITE_FETCH_IMPERSONATE      (default: chrome131)
@@ -33,8 +36,8 @@ Drop-in `requests`-compatible `get()` available via:
     from polite_fetch import get
     response = get("https://example.com/api")  # returns requests.Response
 
-This module is import-side-effect-free. The token-bucket ledger is lazy-init
-on first call. curl_cffi and playwright imports are deferred.
+This module is import-side-effect-free. The token-bucket ledger and robots.txt
+cache are lazy-init on first call. curl_cffi and playwright imports are deferred.
 """
 from __future__ import annotations
 
@@ -47,6 +50,7 @@ from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
 
 logger = logging.getLogger("polite_fetch")
 
@@ -58,7 +62,7 @@ _DEFAULT_USER_AGENT = (
 )
 
 # Anti-bot signatures we use to decide Tier-1 → Tier-2 escalation.
-# These are markers we've seen in practice; not exhaustive but cheap.
+# These are markers seen in practice; not exhaustive but cheap.
 _ANTI_BOT_SIGNATURES = (
     "cloudflare",
     "datadome",
@@ -70,6 +74,8 @@ _ANTI_BOT_SIGNATURES = (
     "incapsula",
     "challenge-platform",
     "cf-mitigated",
+    "kasada",   # Kasada bot-management platform
+    "kpsdk",    # Kasada SDK marker in response body/headers
 )
 
 
@@ -190,23 +196,132 @@ def _domain_of(url: str) -> str:
         return ""
 
 
+# ── robots.txt cache (RFC 9309; 24h TTL) ─────────────────────────────────────
+
+_ROBOTS_TTL_SECONDS: int = 24 * 3600  # 24 hours
+_ROBOTS_CACHE: dict[str, tuple[RobotFileParser | None, float]] = {}
+_ROBOTS_CACHE_LOCK = Lock()
+
+
+def _robots_base_url(url: str) -> str:
+    """Return the canonical robots.txt URL for the given URL's domain."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+
+
+def _fetch_and_parse_robots(
+    robots_url: str, user_agent: str, timeout: int = 10
+) -> RobotFileParser | None:
+    """Fetch and parse robots.txt; returns a parser or None on network failure.
+
+    Follows RFC 9309 §2.2.3 status-code semantics:
+      • 200  → parse normally
+      • 401/403 → treat as "Disallow: /" (auth required = not crawlable)
+      • 404/other → treat as "allow all" (absent = unrestricted)
+    """
+    parser = RobotFileParser()
+    try:
+        import requests
+
+        r = requests.get(
+            robots_url,
+            headers={"User-Agent": user_agent},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if r.status_code == 200:
+            parser.parse(r.text.splitlines())
+        elif r.status_code in (401, 403):
+            parser.parse(["User-agent: *", "Disallow: /"])
+        # 404 or other → leave parser empty → can_fetch returns True (allow all)
+    except Exception:
+        return None
+    return parser
+
+
+def _get_robots(url: str, user_agent: str) -> RobotFileParser | None:
+    """Return a cached RobotFileParser for the URL's domain (24h TTL).
+
+    Cache miss causes a blocking robots.txt fetch outside the domain rate limit.
+    On concurrent cache miss, may fetch twice; the second writer wins (harmless).
+    """
+    robots_url = _robots_base_url(url)
+    now = time.time()
+    with _ROBOTS_CACHE_LOCK:
+        entry = _ROBOTS_CACHE.get(robots_url)
+        if entry is not None:
+            parser, expires = entry
+            if now < expires:
+                return parser
+    parser = _fetch_and_parse_robots(robots_url, user_agent)
+    with _ROBOTS_CACHE_LOCK:
+        _ROBOTS_CACHE[robots_url] = (parser, now + _ROBOTS_TTL_SECONDS)
+    return parser
+
+
+def can_fetch(url: str, user_agent: str) -> bool:
+    """Return True if robots.txt permits fetching *url* for *user_agent*.
+
+    Fetches robots.txt on first call per domain; result cached for 24h.
+    Compliant with RFC 9309:
+      • Returns True (allow) if robots.txt is unreachable or returns 404.
+      • Returns False (block) if robots.txt returns 401/403 or Disallow matches.
+    """
+    parser = _get_robots(url, user_agent)
+    if parser is None:
+        return True  # Network failure → conservative allow
+    return parser.can_fetch(user_agent, url)
+
+
+def robots_crawl_delay(url: str, user_agent: str) -> float | None:
+    """Return robots.txt Crawl-Delay (seconds) for url's domain, or None if absent."""
+    parser = _get_robots(url, user_agent)
+    if parser is None:
+        return None
+    return parser.crawl_delay(user_agent)
+
+
+def _apply_robots_crawl_delay(
+    bucket: _TokenBucket, crawl_delay_sec: float | None
+) -> None:
+    """Slow the token bucket to honor robots.txt Crawl-Delay (never speeds up).
+
+    If Crawl-Delay requires a slower rate than the current bucket, lowers it
+    in-place. The change persists for the bucket's lifetime (tied to the domain).
+    """
+    if crawl_delay_sec is None or crawl_delay_sec <= 0:
+        return
+    crawl_rps = 1.0 / crawl_delay_sec
+    with bucket.lock:
+        if bucket.rate > crawl_rps:
+            bucket.rate = crawl_rps
+
+
 # ── Anti-bot signature detection ─────────────────────────────────────────────
 
 
 def looks_like_anti_bot(status: int, body: str, headers: dict[str, str]) -> bool:
     """Heuristic — does this 4xx response look like an anti-bot challenge?
 
-    Looking at:
-      • Status code (403/429/503 most common; 451 sometimes)
+    Checks:
+      • Status code (403/429/503/451 most common)
       • Response body containing WAF/bot-product names
-      • Response headers (cf-mitigated, server: cloudflare, etc.)
+      • Response headers (cf-mitigated, server: cloudflare, x-kpsdk, etc.)
     """
     if status not in (403, 429, 503, 451):
         return False
     body_lower = (body or "").lower()
     if any(sig in body_lower for sig in _ANTI_BOT_SIGNATURES):
         return True
-    for hdr_name in ("server", "cf-mitigated", "x-perimeterx", "x-datadome", "x-akamai"):
+    for hdr_name in (
+        "server",
+        "cf-mitigated",
+        "x-perimeterx",
+        "x-datadome",
+        "x-akamai",
+        "x-kpsdk-ct",
+        "x-kpsdk-cr",
+    ):
         val = headers.get(hdr_name) or headers.get(hdr_name.lower()) or ""
         if any(sig in val.lower() for sig in _ANTI_BOT_SIGNATURES):
             return True
@@ -255,11 +370,14 @@ def browser_hint_headers(impersonate_target: str) -> dict[str, str]:
     """
     try:
         from browserforge.headers import HeaderGenerator  # type: ignore
+
         gen = HeaderGenerator(browser=("chrome",), os=("linux",))
         hdrs = gen.generate()
         return {k: str(v) for k, v in hdrs.items() if isinstance(v, (str, int, float))}
     except Exception:
-        return dict(_HAND_ROLLED_HINTS.get(impersonate_target, _HAND_ROLLED_HINTS["chrome142"]))
+        return dict(
+            _HAND_ROLLED_HINTS.get(impersonate_target, _HAND_ROLLED_HINTS["chrome142"])
+        )
 
 
 # ── Tier-1 fetcher: requests + honest UA ─────────────────────────────────────
@@ -268,6 +386,7 @@ def browser_hint_headers(impersonate_target: str) -> dict[str, str]:
 def _tier1_fetch(url: str, timeout: int, headers: dict[str, str]) -> dict[str, Any]:
     try:
         import requests
+
         r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         return {
             "ok": 200 <= r.status_code < 300,
@@ -293,7 +412,10 @@ def _tier1_fetch(url: str, timeout: int, headers: dict[str, str]) -> dict[str, A
 def _tier2_fetch(url: str, timeout: int, impersonate: str) -> dict[str, Any]:
     try:
         from curl_cffi import requests as cf_requests  # type: ignore
-        r = cf_requests.get(url, impersonate=impersonate, timeout=timeout, allow_redirects=True)  # type: ignore[arg-type]
+
+        r = cf_requests.get(  # type: ignore[arg-type]
+            url, impersonate=impersonate, timeout=timeout, allow_redirects=True
+        )
         return {
             "ok": 200 <= r.status_code < 300,
             "status": r.status_code,
@@ -302,9 +424,23 @@ def _tier2_fetch(url: str, timeout: int, impersonate: str) -> dict[str, Any]:
             "tier": 2,
         }
     except ImportError:
-        return {"ok": False, "status": 0, "headers": {}, "content": "", "tier": 2, "error": "curl_cffi not installed"}
+        return {
+            "ok": False,
+            "status": 0,
+            "headers": {},
+            "content": "",
+            "tier": 2,
+            "error": "curl_cffi not installed",
+        }
     except Exception as exc:
-        return {"ok": False, "status": 0, "headers": {}, "content": "", "tier": 2, "error": str(exc)}
+        return {
+            "ok": False,
+            "status": 0,
+            "headers": {},
+            "content": "",
+            "tier": 2,
+            "error": str(exc),
+        }
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -320,6 +456,11 @@ def polite_fetch(
 ) -> dict[str, Any]:
     """Fetch a URL with politeness-first hierarchy + Retry-After + jitter.
 
+    Before the first attempt:
+      1. Checks robots.txt (can_fetch gate, RFC 9309) — returns blocked result
+         immediately if disallowed.
+      2. Reads Crawl-Delay from robots.txt and caps the domain token bucket.
+
     Tier-1 (default): requests + honest contact-bearing UA.
     Tier-2 (fallback): curl_cffi browser-impersonate, only on anti-bot 4xx.
     Tier-3: playwright + stealth — opt-in via env POLITE_FETCH_ESCALATE_TIER3=1.
@@ -329,17 +470,42 @@ def polite_fetch(
         max_attempts:  Total attempts across tiers (default 4).
         timeout:       Per-attempt timeout in seconds.
         cap_backoff:   Maximum jitter-backoff sleep (caps exponential growth).
-        config:        Override config (default: read research-limits.yaml).
+        config:        Override config (default: read env vars).
 
     Returns:
         dict with keys: ok, status, headers, content, tier, attempts,
         domain, retry_after_observed, escalated.
+        On robots.txt block: also sets blocked_by_robots_txt=True.
     """
     cfg = config or _load_config()
     domain = _domain_of(url)
     bucket = _get_bucket(domain, cfg["per_domain_rps"], cfg["per_domain_burst"])
 
-    last_result: dict[str, Any] = {"ok": False, "status": 0, "tier": 0, "content": "", "headers": {}}
+    # ── robots.txt gate (RFC 9309) ───────────────────────────────────────────
+    if cfg["honor_robots_crawl_delay"]:
+        ua = cfg["user_agent"]
+        if not can_fetch(url, ua):
+            return {
+                "ok": False,
+                "status": 0,
+                "headers": {},
+                "content": "",
+                "tier": 0,
+                "domain": domain,
+                "retry_after_observed": [],
+                "escalated": False,
+                "blocked_by_robots_txt": True,
+                "reason": "blocked by robots.txt",
+            }
+        _apply_robots_crawl_delay(bucket, robots_crawl_delay(url, ua))
+
+    last_result: dict[str, Any] = {
+        "ok": False,
+        "status": 0,
+        "tier": 0,
+        "content": "",
+        "headers": {},
+    }
     retry_after_observed: list[float] = []
     escalated = False
 
@@ -355,14 +521,14 @@ def polite_fetch(
                 "Accept-Language": "en-US,en;q=0.9",
             }
             result = _tier1_fetch(url, timeout, headers)
-        elif (
-            cfg["escalate_to_curl_cffi_on_4xx"]
-            and looks_like_anti_bot(last_result.get("status", 0), last_result.get("content", ""), last_result.get("headers", {}))
+        elif cfg["escalate_to_curl_cffi_on_4xx"] and looks_like_anti_bot(
+            last_result.get("status", 0),
+            last_result.get("content", ""),
+            last_result.get("headers", {}),
         ):
             escalated = True
             result = _tier2_fetch(url, timeout, cfg["curl_cffi_impersonate"])
         else:
-            # Plain retry on Tier-1 (network errors, 5xx)
             headers = {
                 "User-Agent": cfg["user_agent"],
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -386,21 +552,29 @@ def polite_fetch(
         if retry_seconds is not None:
             retry_after_observed.append(retry_seconds)
             wait = min(retry_seconds, cfg["retry_after_max_seconds"])
-            logger.info(f"[polite_fetch] {domain} returned {result['status']} with Retry-After={retry_seconds:.1f}s; sleeping {wait:.1f}s")
+            logger.info(
+                "[polite_fetch] %s returned %d with Retry-After=%.1fs; sleeping %.1fs",
+                domain, result["status"], retry_seconds, wait,
+            )
             time.sleep(wait)
             continue
 
         # No Retry-After — full-jitter backoff
         if attempt < max_attempts - 1:
             wait = full_jitter_backoff(attempt, base=1.0, cap=cap_backoff)
-            logger.info(f"[polite_fetch] {domain} attempt {attempt+1} failed (status={result.get('status', 0)}); jitter-backoff {wait:.1f}s")
+            logger.info(
+                "[polite_fetch] %s attempt %d failed (status=%d); jitter-backoff %.1fs",
+                domain, attempt + 1, result.get("status", 0), wait,
+            )
             time.sleep(wait)
 
     # All attempts exhausted
     last_result["domain"] = domain
     last_result["retry_after_observed"] = retry_after_observed
     last_result["escalated"] = escalated
-    last_result["reason"] = f"exhausted {max_attempts} attempts; final status={last_result.get('status', 0)}"
+    last_result["reason"] = (
+        f"exhausted {max_attempts} attempts; final status={last_result.get('status', 0)}"
+    )
     return last_result
 
 
@@ -418,4 +592,6 @@ __all__ = [
     "full_jitter_backoff",
     "looks_like_anti_bot",
     "browser_hint_headers",
+    "can_fetch",
+    "robots_crawl_delay",
 ]
