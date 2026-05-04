@@ -231,3 +231,272 @@ def test_browser_hint_headers_returns_dict():
     # User-Agent always present (case-insensitive — browserforge may normalize)
     has_ua = any(k.lower() == "user-agent" for k in hdrs)
     assert has_ua, f"no User-Agent in {list(hdrs.keys())}"
+
+
+# ── robots.txt: _robots_base_url ─────────────────────────────────────────────
+
+
+def test_robots_base_url_standard():
+    assert pf._robots_base_url("https://example.com/some/page") == "https://example.com/robots.txt"
+
+
+def test_robots_base_url_preserves_port():
+    assert pf._robots_base_url("http://example.com:8080/page") == "http://example.com:8080/robots.txt"
+
+
+# ── robots.txt: _fetch_and_parse_robots ──────────────────────────────────────
+
+
+def test_fetch_robots_200_parses(monkeypatch):
+    """200 response with disallow rule is parsed correctly."""
+    import urllib.robotparser
+
+    class FakeResp:
+        status_code = 200
+        text = "User-agent: *\nDisallow: /private/"
+
+    def fake_get(url, **kwargs):
+        return FakeResp()
+
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+    parser = pf._fetch_and_parse_robots("https://example.com/robots.txt", "TestBot")
+    assert parser is not None
+    assert not parser.can_fetch("TestBot", "https://example.com/private/page")
+    assert parser.can_fetch("TestBot", "https://example.com/public/page")
+
+
+def test_fetch_robots_403_disallows_all(monkeypatch):
+    """403 response → treat as Disallow: / (RFC 9309 §2.2.3)."""
+    class FakeResp:
+        status_code = 403
+        text = "Forbidden"
+
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: FakeResp())
+    parser = pf._fetch_and_parse_robots("https://example.com/robots.txt", "TestBot")
+    assert parser is not None
+    assert not parser.can_fetch("TestBot", "https://example.com/any/path")
+
+
+def test_fetch_robots_404_allows_all(monkeypatch):
+    """404 response → treat as allow all (RFC 9309 §2.2.3)."""
+    class FakeResp:
+        status_code = 404
+        text = "Not Found"
+
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: FakeResp())
+    parser = pf._fetch_and_parse_robots("https://example.com/robots.txt", "TestBot")
+    assert parser is not None
+    assert parser.can_fetch("TestBot", "https://example.com/any/path")
+
+
+def test_fetch_robots_network_error_returns_none(monkeypatch):
+    """Network error → returns None (caller treats as allow)."""
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("refused")))
+    parser = pf._fetch_and_parse_robots("https://example.com/robots.txt", "TestBot")
+    assert parser is None
+
+
+# ── robots.txt: can_fetch ────────────────────────────────────────────────────
+
+
+def test_can_fetch_allows_when_robots_unreachable(monkeypatch):
+    """If robots.txt cannot be fetched, allow (conservative)."""
+    monkeypatch.setattr(pf, "_get_robots", lambda url, ua: None)
+    assert pf.can_fetch("https://example.com/page", "TestBot")
+
+
+def test_can_fetch_blocks_disallowed(monkeypatch):
+    """can_fetch returns False when robots.txt disallows the path."""
+    import urllib.robotparser
+    parser = urllib.robotparser.RobotFileParser()
+    parser.parse(["User-agent: *", "Disallow: /private/"])
+    monkeypatch.setattr(pf, "_get_robots", lambda url, ua: parser)
+    assert not pf.can_fetch("https://example.com/private/page", "TestBot")
+
+
+def test_can_fetch_allows_permitted_path(monkeypatch):
+    """can_fetch returns True for paths not in Disallow."""
+    import urllib.robotparser
+    parser = urllib.robotparser.RobotFileParser()
+    parser.parse(["User-agent: *", "Disallow: /private/"])
+    monkeypatch.setattr(pf, "_get_robots", lambda url, ua: parser)
+    assert pf.can_fetch("https://example.com/public/page", "TestBot")
+
+
+# ── robots.txt: robots_crawl_delay ───────────────────────────────────────────
+
+
+def test_robots_crawl_delay_returns_value(monkeypatch):
+    """Returns the Crawl-Delay when present in robots.txt."""
+    import urllib.robotparser
+    parser = urllib.robotparser.RobotFileParser()
+    parser.parse(["User-agent: *", "Crawl-delay: 5"])
+    monkeypatch.setattr(pf, "_get_robots", lambda url, ua: parser)
+    delay = pf.robots_crawl_delay("https://example.com/page", "TestBot")
+    assert delay == 5.0
+
+
+def test_robots_crawl_delay_none_when_not_set(monkeypatch):
+    """Returns None when Crawl-Delay is absent."""
+    import urllib.robotparser
+    parser = urllib.robotparser.RobotFileParser()
+    parser.parse(["User-agent: *", "Disallow: /private/"])
+    monkeypatch.setattr(pf, "_get_robots", lambda url, ua: parser)
+    assert pf.robots_crawl_delay("https://example.com/page", "TestBot") is None
+
+
+def test_robots_crawl_delay_none_when_unreachable(monkeypatch):
+    """Returns None when robots.txt is unreachable."""
+    monkeypatch.setattr(pf, "_get_robots", lambda url, ua: None)
+    assert pf.robots_crawl_delay("https://example.com/page", "TestBot") is None
+
+
+# ── robots.txt: _apply_robots_crawl_delay ────────────────────────────────────
+
+
+def test_apply_robots_crawl_delay_slows_bucket():
+    """Crawl-Delay slower than bucket rate → bucket rate is lowered."""
+    bucket = pf._TokenBucket(rate=2.0, burst=5)  # 2 req/sec
+    pf._apply_robots_crawl_delay(bucket, crawl_delay_sec=10.0)  # 0.1 req/sec
+    assert abs(bucket.rate - 0.1) < 1e-9
+
+
+def test_apply_robots_crawl_delay_no_op_when_already_slower():
+    """Crawl-Delay faster than bucket rate → bucket rate unchanged."""
+    bucket = pf._TokenBucket(rate=0.5, burst=5)  # 0.5 req/sec (2s between req)
+    pf._apply_robots_crawl_delay(bucket, crawl_delay_sec=1.0)  # 1 req/sec (faster)
+    assert abs(bucket.rate - 0.5) < 1e-9  # unchanged
+
+
+def test_apply_robots_crawl_delay_none_is_noop():
+    """None crawl_delay → bucket unchanged."""
+    bucket = pf._TokenBucket(rate=1.0, burst=5)
+    pf._apply_robots_crawl_delay(bucket, None)
+    assert bucket.rate == 1.0
+
+
+def test_apply_robots_crawl_delay_zero_is_noop():
+    """Zero or negative crawl_delay → bucket unchanged (defensive)."""
+    bucket = pf._TokenBucket(rate=1.0, burst=5)
+    pf._apply_robots_crawl_delay(bucket, 0.0)
+    assert bucket.rate == 1.0
+
+
+# ── Kasada anti-bot signature ─────────────────────────────────────────────────
+
+
+def test_kasada_body_detected():
+    """Body containing 'kasada' triggers anti-bot detection."""
+    assert pf.looks_like_anti_bot(403, "kasada challenge page", {})
+
+
+def test_kpsdk_body_detected():
+    """Body containing 'kpsdk' (Kasada SDK marker) triggers detection."""
+    assert pf.looks_like_anti_bot(403, "window.kpsdk = {}", {})
+
+
+def test_kpsdk_header_detected():
+    """Kasada SDK headers (x-kpsdk-ct) trigger anti-bot detection."""
+    assert pf.looks_like_anti_bot(403, "", {"x-kpsdk-ct": "kpsdk-challenge-token"})
+
+
+# ── polite_fetch: robots.txt gate integration ─────────────────────────────────
+
+
+def test_polite_fetch_blocked_by_robots_txt(monkeypatch):
+    """polite_fetch returns blocked result when can_fetch is False."""
+    monkeypatch.setattr(pf, "can_fetch", lambda url, ua: False)
+    monkeypatch.setattr(pf, "robots_crawl_delay", lambda url, ua: None)
+    result = pf.polite_fetch(
+        "https://example.com/private/page",
+        config={
+            "user_agent": "TestBot",
+            "per_domain_rps": 1.0,
+            "per_domain_burst": 5,
+            "honor_robots_crawl_delay": True,
+            "escalate_to_curl_cffi_on_4xx": True,
+            "escalate_to_browser": False,
+            "curl_cffi_impersonate": "chrome131",
+            "retry_after_max_seconds": 300,
+        },
+    )
+    assert not result["ok"]
+    assert result.get("blocked_by_robots_txt") is True
+    assert "robots.txt" in result.get("reason", "")
+
+
+def test_polite_fetch_robots_not_checked_when_disabled(monkeypatch):
+    """When honor_robots_crawl_delay=False, can_fetch is never called."""
+    called = {"n": 0}
+
+    def spy_can_fetch(url, ua):
+        called["n"] += 1
+        return False  # would block if called
+
+    monkeypatch.setattr(pf, "can_fetch", spy_can_fetch)
+
+    def fake_tier1(url, timeout, headers):
+        return {"ok": True, "status": 200, "headers": {}, "content": "ok", "tier": 1}
+
+    monkeypatch.setattr(pf, "_tier1_fetch", fake_tier1)
+
+    result = pf.polite_fetch(
+        "https://example.com/page",
+        config={
+            "user_agent": "TestBot",
+            "per_domain_rps": 1.0,
+            "per_domain_burst": 5,
+            "honor_robots_crawl_delay": False,
+            "escalate_to_curl_cffi_on_4xx": False,
+            "escalate_to_browser": False,
+            "curl_cffi_impersonate": "chrome131",
+            "retry_after_max_seconds": 300,
+        },
+    )
+    assert result["ok"]
+    assert called["n"] == 0  # never called
+
+
+def test_polite_fetch_applies_crawl_delay(monkeypatch):
+    """Crawl-Delay from robots.txt is applied to the domain bucket."""
+    applied = {"delay": None}
+
+    def fake_can_fetch(url, ua):
+        return True
+
+    def fake_robots_crawl_delay(url, ua):
+        return 5.0  # 5 second crawl delay
+
+    orig_apply = pf._apply_robots_crawl_delay
+
+    def spy_apply(bucket, delay):
+        applied["delay"] = delay
+        orig_apply(bucket, delay)
+
+    monkeypatch.setattr(pf, "can_fetch", fake_can_fetch)
+    monkeypatch.setattr(pf, "robots_crawl_delay", fake_robots_crawl_delay)
+    monkeypatch.setattr(pf, "_apply_robots_crawl_delay", spy_apply)
+
+    def fake_tier1(url, timeout, headers):
+        return {"ok": True, "status": 200, "headers": {}, "content": "ok", "tier": 1}
+
+    monkeypatch.setattr(pf, "_tier1_fetch", fake_tier1)
+
+    pf.polite_fetch(
+        "https://crawldelay.example.com/page",
+        config={
+            "user_agent": "TestBot",
+            "per_domain_rps": 10.0,
+            "per_domain_burst": 5,
+            "honor_robots_crawl_delay": True,
+            "escalate_to_curl_cffi_on_4xx": False,
+            "escalate_to_browser": False,
+            "curl_cffi_impersonate": "chrome131",
+            "retry_after_max_seconds": 300,
+        },
+    )
+    assert applied["delay"] == 5.0
