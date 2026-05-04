@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import time
 
-from polite_fetch import _core as pf
 import pytest
+
+from polite_fetch import _core as pf
 
 
 @pytest.fixture(autouse=True)
